@@ -19,7 +19,6 @@ from collections import Counter, defaultdict
 
 import numpy as np
 import h5py
-from scipy.misc import imread, imresize
 
 
 """

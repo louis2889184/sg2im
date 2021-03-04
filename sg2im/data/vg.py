@@ -28,6 +28,8 @@ import PIL
 
 from .utils import imagenet_preprocess, Resize
 
+from transformers import DistilBertTokenizer
+
 
 class VgSceneGraphDataset(Dataset):
   def __init__(self, vocab, h5_path, image_dir, image_size=(256, 256),
@@ -119,7 +121,6 @@ class VgSceneGraphDataset(Dataset):
 
     # The last object will be the special __image__ object
     objs[O - 1] = self.vocab['object_name_to_idx']['__image__']
-
     triples = []
     for r_idx in range(self.data['relationships_per_image'][index].item()):
       if not self.include_relationships:
@@ -139,6 +140,85 @@ class VgSceneGraphDataset(Dataset):
 
     triples = torch.LongTensor(triples)
     return image, objs, boxes, triples
+
+
+class TransformerVgSceneGraphDataset(Dataset):
+  def __init__(self, vocab, h5_path, image_dir, image_size=(256, 256),
+               normalize_images=True, max_objects=10, max_samples=None,
+               include_relationships=True, use_orphaned_objects=True):
+    super(TransformerVgSceneGraphDataset, self).__init__()
+
+    self.image_dir = image_dir
+    self.image_size = image_size
+    self.vocab = vocab
+    self.num_objects = len(vocab['object_idx_to_name'])
+    self.use_orphaned_objects = use_orphaned_objects
+    self.max_objects = max_objects
+    self.max_samples = max_samples
+    self.include_relationships = include_relationships
+
+    self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+
+    transform = [Resize(image_size), T.ToTensor()]
+    if normalize_images:
+      transform.append(imagenet_preprocess())
+    self.transform = T.Compose(transform)
+
+    self.data = {}
+    with h5py.File(h5_path, 'r') as f:
+      for k, v in f.items():
+        if k == 'image_paths':
+          self.image_paths = list(v)
+        else:
+          self.data[k] = torch.IntTensor(np.asarray(v))
+
+  def __len__(self):
+    num = self.data['object_names'].size(0)
+    if self.max_samples is not None:
+      return min(self.max_samples, num)
+    return num
+
+  def __getitem__(self, index):
+    """
+    Returns a tuple of:
+    - image: FloatTensor of shape (C, H, W)
+    - objs: LongTensor of shape (O,)
+    - boxes: FloatTensor of shape (O, 4) giving boxes for objects in
+      (x0, y0, x1, y1) format, in a [0, 1] coordinate system.
+    - triples: LongTensor of shape (T, 3) where triples[t] = [i, p, j]
+      means that (objs[i], p, objs[j]) is a triple.
+    """
+    img_path = os.path.join(self.image_dir, self.image_paths[index])
+
+    with open(img_path, 'rb') as f:
+      with PIL.Image.open(f) as image:
+        WW, HH = image.size
+        image = self.transform(image.convert('RGB'))
+
+    H, W = self.image_size
+
+    sents = []
+
+    object_idx_to_name = self.vocab["object_idx_to_name"]
+    pred_idx_to_name = self.vocab["pred_idx_to_name"]
+    obj_mapping = self.data['object_names'][index]
+    for r_idx in range(self.data['relationships_per_image'][index].item()):
+      if not self.include_relationships:
+        break
+      s = self.data['relationship_subjects'][index, r_idx].item()
+      p = self.data['relationship_predicates'][index, r_idx].item()
+      o = self.data['relationship_objects'][index, r_idx].item()
+      
+      s = obj_mapping[s].item()
+      o = obj_mapping[o].item()      
+
+      sent = f"{object_idx_to_name[s]} {pred_idx_to_name[p]} {object_idx_to_name[o]}."
+      sents.append(sent)
+    
+    sent = " ".join(sents)
+
+    sent_tensor = self.tokenizer(sent, return_tensors="pt", padding="max_length", max_length=64, truncation=True)
+    return image, sent_tensor["input_ids"][0], sent_tensor["attention_mask"][0]
 
 
 def vg_collate_fn(batch):
