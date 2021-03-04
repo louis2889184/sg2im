@@ -1,3 +1,10 @@
+# Multimodal Generative Mapping
+
+* Refer to `sg2im/model.py` for the Transformer model. 
+* Refer to `sg2im/data/vg.py` for the data processing (scene graph to descriptions).
+* Refer to `scripts/transformer_train.py` and `scripts/transformer_run_model.py` for the training and inference. The usages are exactly the same as the original ones, so you can find the guideline of training and inference in the TRAINING.md and the original readme.
+---
+The following is the original readme.
 # sg2im
 
 This is the code for the paper
