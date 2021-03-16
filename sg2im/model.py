@@ -358,3 +358,131 @@ class TransformerSg2ImModel(nn.Module):
     """ Convenience method that combines encode_scene_graphs and forward. """
     input_ids, attention_mask = self.encode_scene_graphs(scene_graphs, tokenizer)
     return self.forward(input_ids, attention_mask)
+
+
+
+class SequenceTransformerSg2ImModel(nn.Module):
+  def __init__(self, vocab, image_size=(64, 64), embedding_dim=64,
+               gconv_dim=128, gconv_hidden_dim=512,
+               gconv_pooling='avg', gconv_num_layers=5,
+               refinement_dims=(1024, 512, 256, 128, 64),
+               normalization='batch', activation='leakyrelu-0.2',
+               mask_size=None, mlp_normalization='none', layout_noise_dim=0,
+               **kwargs):
+    super(SequenceTransformerSg2ImModel, self).__init__()
+
+    # We used to have some additional arguments: 
+    # vec_noise_dim, gconv_mode, box_anchor, decouple_obj_predictions
+    if len(kwargs) > 0:
+      print('WARNING: Model got unexpected kwargs ', kwargs)
+
+    self.vocab = vocab
+    self.image_size = image_size
+    self.layout_noise_dim = layout_noise_dim
+
+    num_objs = len(vocab['object_idx_to_name'])
+    num_preds = len(vocab['pred_idx_to_name'])
+
+    self.bert_model = DistilBertModel.from_pretrained('distilbert-base-uncased')
+
+    self.init_size = 64 // 4
+    self.l1 = nn.Sequential(nn.Linear(768, 128 * self.init_size ** 2))
+
+    self.conv_blocks = nn.Sequential(
+        nn.BatchNorm2d(128),
+        nn.Upsample(scale_factor=2),
+        nn.Conv2d(128, 128, 3, stride=1, padding=1),
+        nn.BatchNorm2d(128, 0.8),
+        nn.LeakyReLU(0.2, inplace=True),
+        nn.Upsample(scale_factor=2),
+        nn.Conv2d(128, 64, 3, stride=1, padding=1),
+        nn.BatchNorm2d(64, 0.8),
+        nn.LeakyReLU(0.2, inplace=True),
+        nn.Conv2d(64, 3, 3, stride=1, padding=1)
+    )
+    
+    refinement_kwargs = {
+      'dims': (gconv_dim + layout_noise_dim,) + refinement_dims,
+      'normalization': normalization,
+      'activation': activation,
+    }
+    # self.refinement_net = RefinementNetwork(**refinement_kwargs)
+
+  def _build_mask_net(self, num_objs, dim, mask_size):
+    output_dim = 1
+    layers, cur_size = [], 1
+    while cur_size < mask_size:
+      layers.append(nn.Upsample(scale_factor=2, mode='nearest'))
+      layers.append(nn.BatchNorm2d(dim))
+      layers.append(nn.Conv2d(dim, dim, kernel_size=3, padding=1))
+      layers.append(nn.ReLU())
+      cur_size *= 2
+    if cur_size != mask_size:
+      raise ValueError('Mask size must be a power of 2')
+    layers.append(nn.Conv2d(dim, output_dim, kernel_size=1))
+    return nn.Sequential(*layers)
+
+  def forward(self, input_ids, attention_mask):
+    output = self.bert_model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+    output = output["last_hidden_state"][:, 0, :]
+    output = self.l1(output)
+    
+    output = output.view(input_ids.shape[0], 128, self.init_size, self.init_size)
+    layout = self.conv_blocks(output)
+
+    # img = self.refinement_net(layout)
+    img = layout
+    return img
+
+  def encode_scene_graphs(self, scene_graphs, tokenizer):
+    """
+    Encode one or more scene graphs using this model's vocabulary. Inputs to
+    this method are scene graphs represented as dictionaries like the following:
+
+    {
+      "objects": ["cat", "dog", "sky"],
+      "relationships": [
+        [0, "next to", 1],
+        [0, "beneath", 2],
+        [2, "above", 1],
+      ]
+    }
+
+    This scene graph has three relationshps: cat next to dog, cat beneath sky,
+    and sky above dog.
+
+    Inputs:
+    - scene_graphs: A dictionary giving a single scene graph, or a list of
+      dictionaries giving a sequence of scene graphs.
+
+    Returns a tuple of LongTensors (objs, triples, obj_to_img) that have the
+    same semantics as self.forward. The returned LongTensors will be on the
+    same device as the model parameters.
+    """
+    if isinstance(scene_graphs, dict):
+      # We just got a single scene graph, so promote it to a list
+      scene_graphs = [scene_graphs]
+
+    objs, triples, obj_to_img = [], [], []
+    obj_offset = 0
+    sents_list = []
+    for i, sg in enumerate(scene_graphs):
+      # Insert dummy __image__ object and __in_image__ relationships
+      sents = []
+      for s, p, o in sg['relationships']:
+        sent = f"{sg['objects'][s]} {p} {sg['objects'][o]}."
+        sents.append(sent)
+
+      sent = " ".join(sents)
+      sents_list.append(sent)
+
+      print(sent)
+    
+    device = next(self.parameters()).device
+    sent_tensor = tokenizer(sents_list, return_tensors="pt", padding="max_length", max_length=64, truncation=True)
+    return sent_tensor["input_ids"].to(device), sent_tensor["attention_mask"].to(device)
+
+  def forward_json(self, scene_graphs, tokenizer):
+    """ Convenience method that combines encode_scene_graphs and forward. """
+    input_ids, attention_mask = self.encode_scene_graphs(scene_graphs, tokenizer)
+    return self.forward(input_ids, attention_mask)
