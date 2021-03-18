@@ -13,7 +13,12 @@ from sg2im.data.vg import SequenceTransformerVgSceneGraphDataset
 
 import pytorch_lightning as pl
 from transformers import (
-    BertTokenizerFast, BertTokenizer, EncoderDecoderModel, EncoderDecoderConfig, AutoModel
+    BertTokenizerFast, 
+    BertTokenizer, 
+    EncoderDecoderModel, 
+    EncoderDecoderConfig, 
+    AutoModel,
+    BertForSequenceClassification,
 )
 
 from pytorch_lightning.plugins import DDPPlugin
@@ -26,7 +31,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--test', action='store_true', default=False)
 parser.add_argument('--dataset', default='coco', choices=['vg', 'coco'])
 parser.add_argument('--scene_graphs_json', default='scene_graphs/figure_6_sheep.json')
-parser.add_argument('--load_checkpoint')
+parser.add_argument('--load_checkpoint', default="")
 
 # Optimization hyperparameters
 parser.add_argument('--batch_size', default=32, type=int)
@@ -133,6 +138,7 @@ class VGDataModule(pl.LightningDataModule):
         self.batch_size = args.batch_size
 
     def setup(self, stage=None):
+        args = self.args
         with open(args.vocab_json, 'r') as f:
             vocab = json.load(f)
         dset_kwargs = {
@@ -176,32 +182,19 @@ class VGDataModule(pl.LightningDataModule):
 class Discriminator(nn.Module):
     def __init__(self, backbone):
         super().__init__()
-        self.backbone = backbone
+        self.backbone = BertForSequenceClassification.from_pretrained(backbone)
         
-        dim = backbone.config.hidden_size
-        self.binary_classifier = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.ReLU(True),
-            nn.Linear(dim, dim),
-            nn.ReLU(True),
-            nn.Linear(dim, 1),
-        )
-
     def forward(self, *args, **kwargs):
         outputs = self.backbone(*args, **kwargs)
 
-        features = outputs["last_hidden_state"][:, 0, :]
-
-        true_fake_preds = self.binary_classifier(features)
-
-        return true_fake_preds
+        return outputs["loss"]
 
     def apply_word_embeddings(self, inputs):
         """
         Because Gumbel softmax outputs cannot directly feed to huggingface model,
         we have to compute the `input_embed` manually.
         """
-        word_embeddings = self.backbone.embeddings.word_embeddings
+        word_embeddings = self.backbone.bert.embeddings.word_embeddings
 
         return torch.matmul(inputs, word_embeddings.weight)
 
@@ -209,7 +202,12 @@ class Discriminator(nn.Module):
 class Generator(nn.Module):
     def __init__(self, backbone):
         super().__init__()
-        self.backbone = backbone
+        self.backbone = EncoderDecoderModel.from_encoder_decoder_pretrained(
+            backbone, backbone, tie_encoder_decoder=True
+        )
+
+    def forward(self, *args, **kwargs):
+        return self.backbone(*args, **kwargs)
 
     def forward_logits(self, *args, **kwargs):
         return self.backbone(*args, **kwargs)["logits"]
@@ -233,8 +231,7 @@ class GAN(pl.LightningModule):
         self,
         args,
         tokenizer,
-        generator,
-        discriminator
+        backbone=None,
     ):
         super().__init__()
 
@@ -242,13 +239,35 @@ class GAN(pl.LightningModule):
 
         self.validation_z = torch.randn(8, 100)
         self.tokenizer = tokenizer
-        self.generator = generator
-        self.discriminator = discriminator
+        self.discriminator = Discriminator(backbone)
+        self.generator = Generator(backbone)
 
         self.graph_special_token = "[graph]"
         self.image_special_token = "[image]"
 
         self.tau = 1
+
+        self.image_token_id_list, self.text_token_id_list = self.retrieve_bad_image_text_tokens_ids()
+
+    def retrieve_bad_image_text_tokens_ids(self):
+        special_tokens_list = ["[CLS]", "[SEP]"]
+        image_tokens_list = [f"[itoken{i}]" for i in range(512)]
+        extra_image_tokens_list = [f"[itoken{i}]" for i in range(512, 32 * 32)]
+        
+        vocab = self.tokenizer.get_vocab()
+
+        special_tokens_id_list = [vocab[token] for token in special_tokens_list]
+        image_token_id_list = [vocab[token] for token in image_tokens_list]
+        extra_image_tokens_id_list = [vocab[token] for token in extra_image_tokens_list]
+        text_token_id_list = [v for k, v in vocab.items()]
+
+        text_token_id_list = \
+            list(set(text_token_id_list) - set(image_token_id_list) - set(extra_image_tokens_id_list))
+
+        return image_token_id_list + extra_image_tokens_id_list, text_token_id_list + extra_image_tokens_id_list
+
+    def adversarial_loss(self, y_hat, y):
+        return F.binary_cross_entropy_with_logits(y_hat, y)
 
     def training_step(self, batch, batch_idx, optimizer_idx):
         # sample noise
@@ -299,14 +318,10 @@ class GAN(pl.LightningModule):
             fake_dis_batch = {
                 "inputs_embeds": predictions_embedding,
                 "attention_mask": batch["code_output/attention_mask"],
+                "labels": torch.ones(predictions_embedding.shape[0]).type_as(predictions_embedding).long()
             }
 
-            true_fake_preds = self.discriminator(**fake_dis_batch)
-
-            valid = torch.ones(true_fake_preds.shape)
-            valid = valid.type_as(true_fake_preds)
-
-            g_d_loss = F.binary_cross_entropy_with_logits(true_fake_preds, valid)
+            g_d_loss = self.discriminator(**fake_dis_batch)
 
             g_loss = g_d_loss + ac_loss
             # g_loss = ac_loss
@@ -356,61 +371,61 @@ class GAN(pl.LightningModule):
 
             self.log('ac_loss', ac_loss, prog_bar=True)
             # return {"loss": ac_loss}
-            return {"loss": g_loss + ac_loss}
+            return g_loss + ac_loss
 
         # train discriminator
         if optimizer_idx == 1:
             # Measure discriminator's ability to classify real from generated samples
+
             logits = self.generator.forward_logits(**generator_batch)
 
             # don't compute the gradients of the generator
-            predictions = torch.argmax(logits, dim=-1)
+            predictions = F.gumbel_softmax(logits, tau=self.tau, hard=True, dim=-1)
+
+            predictions_embedding = self.discriminator.apply_word_embeddings(predictions)
 
             fake_dis_batch = {
-                "input_ids": predictions,
+                "inputs_embeds": predictions_embedding,
                 "attention_mask": batch["code_output/attention_mask"],
+                "labels": torch.zeros(predictions.shape[0]).type_as(predictions).long()
             }
 
-            fake_preds = self.discriminator(**fake_dis_batch)
+            fake_loss = self.discriminator(**fake_dis_batch)
 
-            fake = torch.zeros(fake_preds.shape)
-            fake = fake.type_as(fake_preds)
+            # fake = torch.zeros(fake_preds.shape)
+            # fake = fake.type_as(fake_preds)
 
-            fake_loss = F.binary_cross_entropy_with_logits(fake_preds, fake)
+            # fake_loss = self.adversarial_loss(fake_preds, fake)
 
             real_dis_batch = {
                 "input_ids": batch["code_output/input_ids"],
                 "attention_mask": batch["code_output/attention_mask"],
+                "labels": torch.ones(predictions.shape[0]).type_as(predictions).long()
             }
 
-            real_preds = self.discriminator(**real_dis_batch)
+            real_loss = self.discriminator(**real_dis_batch)
 
-            real = torch.ones(real_preds.shape)
-            real = real.type_as(real_preds)
+            # real = torch.ones(real_preds.shape)
+            # real = real.type_as(real_preds)
 
-            real_loss = F.binary_cross_entropy_with_logits(real_preds, real)
+            # real_loss = self.adversarial_loss(real_preds, real)
 
             # discriminator loss is the average of these
             d_loss = (real_loss + fake_loss) / 2
 
             self.log('d_loss', d_loss, prog_bar=True)
-            return {"loss": d_loss}
+            return d_loss
 
     def configure_optimizers(self):
         lr = self.args.learning_rate
 
         opt_g = torch.optim.Adam(self.generator.parameters(), lr=lr, betas=(0.5, 0.999))
-        opt_d1 = torch.optim.Adam(
-            self.generator.parameters(), 
-            lr=lr, 
-            betas=(0.5, 0.999)
-        )
-        opt_d2 = torch.optim.Adam(
+        opt_d = torch.optim.Adam(
             self.discriminator.parameters(), 
             lr=lr, 
             betas=(0.5, 0.999)
         )
-        return [opt_g, opt_d2], []
+        return [opt_g, opt_d], []
 
     # def on_epoch_end(self):
     #     z = self.validation_z.type_as(self.generator.model[0].weight)
@@ -419,6 +434,9 @@ class GAN(pl.LightningModule):
     #     sample_imgs = self(z)
     #     grid = torchvision.utils.make_grid(sample_imgs)
     #     self.logger.experiment.add_image('generated_images', grid, self.current_epoch)
+
+    def test_step(self, batch, batch_idx):
+        pass
 
     def inference(self, scene_graphs_json):
         scene_graphs = self.read_scene_graphs(scene_graphs_json)
@@ -432,13 +450,17 @@ class GAN(pl.LightningModule):
             do_sample=True,
             top_p=0.92, 
             top_k=0,
-            decoder_start_token_id=self.generator.backbone.config.decoder.pad_token_id
+            decoder_start_token_id=self.generator.backbone.config.decoder.pad_token_id,
+            bad_words_ids=[[ids] for ids in self.text_token_id_list],
         )
 
         print(image_tokens_generation)
 
+        output = []
+
         for data in image_tokens_generation:
-            print(self.tokenizer.decode(data, skip_special_tokens=True))
+            output.append(self.tokenizer.decode(data, skip_special_tokens=True))
+            print(output[-1])
 
         reconstructed_graph = self.generator.backbone.generate(
             image_tokens_generation, 
@@ -449,12 +471,20 @@ class GAN(pl.LightningModule):
             do_sample=True,
             top_p=0.92, 
             top_k=0,
-            decoder_start_token_id=self.generator.backbone.config.decoder.pad_token_id
+            decoder_start_token_id=self.generator.backbone.config.decoder.pad_token_id,
+            bad_words_ids=[[ids]for ids in self.image_token_id_list],
         )
 
         for data in reconstructed_graph:
             print(self.tokenizer.decode(data, skip_special_tokens=True))
 
+        
+        if not os.path.exists(self.args.output_dir):
+            os.makedirs(self.args.output_dir)
+        itokens_output_file = os.path.join(self.args.output_dir, "itokens_output.json")
+
+        with open(itokens_output_file, "w") as f:
+            json.dump(output, f, indent=2)
 
     def read_scene_graphs(self, scene_graphs_json):
         with open(scene_graphs_json, 'r') as f:
@@ -486,7 +516,8 @@ class GAN(pl.LightningModule):
             return_tensors="pt", 
             padding="max_length", 
             max_length=64, 
-            truncation=True
+            truncation=True,
+            add_special_tokens=False
         )
 
         device = next(self.parameters()).device
@@ -496,30 +527,30 @@ class GAN(pl.LightningModule):
 
 
 def main(args):
-    tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased-itokens")
+    backbone = "bert-base-uncased-itokens"
+    tokenizer = BertTokenizerFast.from_pretrained(backbone)
 
     # encoder_decoder_config = EncoderDecoderConfig.from_pretrained("bert-base-uncased-itokens")
     # model = EncoderDecoderModel.from_pretrained(
     #     "bert-base-uncased-itokens", config=encoder_decoder_config
     # )
 
-    model = EncoderDecoderModel.from_encoder_decoder_pretrained(
-        "bert-base-uncased-itokens", "bert-base-uncased-itokens", tie_encoder_decoder=True
-    )
+    # model = EncoderDecoderModel.from_encoder_decoder_pretrained(
+    #     "bert-base-uncased-itokens", "bert-base-uncased-itokens", tie_encoder_decoder=True
+    # )
 
-    generator = Generator(model)
+    # generator = Generator(model)
 
-    discriminator = Discriminator(
-        AutoModel.from_pretrained("bert-base-uncased-itokens")
-    )
+    # discriminator = Discriminator(
+    #     AutoModel.from_pretrained("bert-base-uncased-itokens")
+    # )
 
     if args.test:
         model = GAN.load_from_checkpoint(
             args.load_checkpoint,
             args=args, 
             tokenizer=tokenizer, 
-            generator=generator, 
-            discriminator=discriminator
+            backbone=backbone
         )
         model.cuda()
         model.eval()
@@ -534,7 +565,15 @@ def main(args):
     else:
         dm = VGDataModule(args, tokenizer)
 
-    model = GAN(args, tokenizer, generator, discriminator)
+    if args.load_checkpoint != "":
+        model = GAN.load_from_checkpoint(
+            args.load_checkpoint, 
+            args=args, 
+            tokenizer=tokenizer, 
+            backbone=backbone
+        )
+    else:
+        model = GAN(args, tokenizer, backbone)
 
     training_args = {
         "gpus": args.gpus,
@@ -548,6 +587,7 @@ def main(args):
         additional_args = {
             "accelerator": "ddp",
             "plugins": [DDPPlugin(find_unused_parameters=True)]
+            # "plugins": [my_ddp]
         }
 
         training_args.update(additional_args)
